@@ -1,0 +1,7 @@
+config BR2_PACKAGE_TRIVMOD
+	bool "trivmod"
+	depends on BR2_LINUX_KERNEL
+	help
+	  Trivial hello world kernel module.
+
+	  https://github.com/dororiya/trivmod-package
