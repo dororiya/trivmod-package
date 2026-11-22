@@ -1,124 +1,172 @@
+cat > ~/trivmod-package/openrel/chr_df_mod.c << 'EOF'
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/fs.h>
+#include <linux/errno.h>
+#include <linux/proc_fs.h>
 #include <linux/cdev.h>
+#include <linux/fs.h>
 #include <linux/device.h>
+#include <linux/version.h>
+
+static int nparam = 5;
+module_param(nparam, int, 0644);
+
+dev_t dev;
+int units = 2;
+
+static struct mod_priv {
+  struct proc_dir_entry *mod_proc;
+  struct cdev mod_cdev;
+  struct class *mod_cl;
+  struct device *mod_dev;
+  int open_count;      /* statistics: how many times opened */
+  int release_count;   /* statistics: how many times closed */
+  int users;           /* statistics: open right now */
+} mod_priv;
+
+static int mod_open (struct inode *inode, struct file *file)
+{
+  struct mod_priv *priv;
+
+  printk (KERN_INFO "triv_mod: open called (minor %d)\n", iminor(inode));
+
+  /* find mod_priv from the cdev inside it */
+  priv = container_of (inode->i_cdev, struct mod_priv, mod_cdev);
+  printk (KERN_INFO "triv_mod: found private data with container_of\n");
+
+  /* save it so release (and later read/write) can use it */
+  file->private_data = priv;
+  printk (KERN_INFO "triv_mod: private_data set\n");
+
+  /* update statistics */
+  priv->open_count++;
+  priv->users++;
+  printk (KERN_INFO "triv_mod: stats: opens=%d closes=%d users=%d\n",
+          priv->open_count, priv->release_count, priv->users);
+
+  return 0;
+}
+
+static int mod_release (struct inode *inode, struct file *file)
+{
+  struct mod_priv *priv = file->private_data;
+
+  printk (KERN_INFO "triv_mod: release called\n");
+
+  /* update statistics */
+  priv->release_count++;
+  priv->users--;
+  printk (KERN_INFO "triv_mod: stats: opens=%d closes=%d users=%d\n",
+          priv->open_count, priv->release_count, priv->users);
+
+  if (priv->users == 0)
+    printk (KERN_INFO "triv_mod: last user closed the device\n");
+
+  return 0;
+}
+
+struct file_operations fops = {
+  .owner   = THIS_MODULE,
+  .open    = mod_open,
+  .release = mod_release,
+};
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0))
+static int mod_read_proc (char *page, char **start, off_t off,
+                                int count, int *eof, void *data) {
+  unsigned char *content, *c;
+  int len = 0;
+  off_t begin = 0;
+
+  content = (char *)(page + off);
+  len = sprintf (content, "param is %d\n", nparam);
+  c = (char *)content+len;
+  if (off > begin + len)
+    return 0;
+  *start = page + (off - begin);
+  *eof = 1;
+
+  return (count < begin + len) ? count : begin + len - off;
+}
+#endif
+
+static int __init trivmod_init (void)
+{
+  int err;
+
+  printk (KERN_INFO "triv_mod loaded, nparam = %d\n", nparam);
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0))
+  mod_priv.mod_proc = create_proc_entry ("driver/mod_proc", 0, 0);
+  if (!mod_priv.mod_proc)
+    return -EFAULT;
+  mod_priv.mod_proc->read_proc = mod_read_proc;
+#endif
+  err = alloc_chrdev_region (&dev, 0, units, "CourseDev");
+  if (err < 0)
+    goto dvr_err;
+  printk (KERN_INFO "triv_mod: got major %d\n", MAJOR(dev));
+
+  cdev_init (&mod_priv.mod_cdev, &fops);
+  err = cdev_add (&mod_priv.mod_cdev, dev, units);
+  if (err < 0)
+    goto cdev_err;
+  printk (KERN_INFO "triv_mod: cdev added\n");
+
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
+  mod_priv.mod_cl = class_create ("CourseDev");
+#else
+  mod_priv.mod_cl = class_create (THIS_MODULE, "CourseDev");
+#endif
+  if (IS_ERR(mod_priv.mod_cl)) {
+    err = PTR_ERR(mod_priv.mod_cl);
+    goto clc_err;
+  }
+  printk (KERN_INFO "triv_mod: class created\n");
+
+  mod_priv.mod_dev = device_create (mod_priv.mod_cl, NULL, dev, NULL, "myDev");
+  if (IS_ERR(mod_priv.mod_dev)) {
+    err = PTR_ERR(mod_priv.mod_dev);
+    goto dvc_err;
+  }
+  printk (KERN_INFO "triv_mod: /dev/myDev created\n");
+
+  return 0;
+dvc_err:
+  class_destroy (mod_priv.mod_cl);
+clc_err:
+  cdev_del (&mod_priv.mod_cdev);
+cdev_err:
+  unregister_chrdev_region (dev, units);
+dvr_err:
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0))
+  remove_proc_entry ("driver/mod_proc", 0);
+#endif
+
+  return err;
+}
+
+static void __exit trivmod_exit (void)
+{
+  printk (KERN_INFO "triv_mod: final stats: opens=%d closes=%d\n",
+          mod_priv.open_count, mod_priv.release_count);
+
+  device_destroy (mod_priv.mod_cl, dev);
+  class_destroy (mod_priv.mod_cl);
+  cdev_del (&mod_priv.mod_cdev);
+  unregister_chrdev_region (dev, units);
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0))
+  remove_proc_entry ("driver/mod_proc", 0);
+#endif
+  printk (KERN_INFO "triv_mod unloaded\n");
+  return;
+}
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Trivial character device with open and release");
+MODULE_VERSION("0.1");
 MODULE_AUTHOR("dororiya");
+MODULE_PARM_DESC(nparam, "A numeric demonstration parameter");
+MODULE_DESCRIPTION("A trivial exercise module");
 
-/* our private data: the cdev is embedded inside it */
-struct trivmod_dev {
-    struct cdev cdev;
-    int open_count;      /* how many times opened */
-    int release_count;   /* how many times closed */
-    int users;           /* how many are open right now */
-};
-
-static dev_t dev;
-static struct trivmod_dev my_dev;   /* statically allocated */
-static struct class *my_class;
-
-static int my_open(struct inode *inode, struct file *file)
-{
-    struct trivmod_dev *d;
-
-    printk(KERN_INFO "trivmod: open called\n");
-
-    /* find our structure from the cdev inside it */
-    d = container_of(inode->i_cdev, struct trivmod_dev, cdev);
-    printk(KERN_INFO "trivmod: found private data with container_of\n");
-
-    /* save it so release (and later read/write) can use it */
-    file->private_data = d;
-    printk(KERN_INFO "trivmod: private_data set\n");
-
-    /* update statistics */
-    d->open_count++;
-    d->users++;
-    printk(KERN_INFO "trivmod: stats: opens=%d closes=%d users=%d\n",
-           d->open_count, d->release_count, d->users);
-
-    return 0;
-}
-
-static int my_release(struct inode *inode, struct file *file)
-{
-    struct trivmod_dev *d = file->private_data;
-
-    printk(KERN_INFO "trivmod: release called\n");
-
-    /* update statistics */
-    d->release_count++;
-    d->users--;
-    printk(KERN_INFO "trivmod: stats: opens=%d closes=%d users=%d\n",
-           d->open_count, d->release_count, d->users);
-
-    if (d->users == 0)
-        printk(KERN_INFO "trivmod: last user closed the device\n");
-
-    return 0;
-}
-
-static struct file_operations my_fops = {
-    .owner   = THIS_MODULE,
-    .open    = my_open,
-    .release = my_release,
-};
-
-static int __init mymod_init(void)
-{
-    if (alloc_chrdev_region(&dev, 0, 1, "trivmod") < 0) {
-        printk(KERN_ERR "trivmod: failed to get device number\n");
-        return -1;
-    }
-    printk(KERN_INFO "trivmod: got major %d\n", MAJOR(dev));
-
-    cdev_init(&my_dev.cdev, &my_fops);
-    if (cdev_add(&my_dev.cdev, dev, 1) < 0) {
-        printk(KERN_ERR "trivmod: failed to add cdev\n");
-        goto err_region;
-    }
-    printk(KERN_INFO "trivmod: cdev added\n");
-
-    my_class = class_create("trivclass");
-    if (IS_ERR(my_class)) {
-        printk(KERN_ERR "trivmod: failed to create class\n");
-        goto err_cdev;
-    }
-    printk(KERN_INFO "trivmod: class created\n");
-
-    if (IS_ERR(device_create(my_class, NULL, dev, NULL, "trivdev"))) {
-        printk(KERN_ERR "trivmod: failed to create device\n");
-        goto err_class;
-    }
-    printk(KERN_INFO "trivmod: /dev/trivdev created\n");
-
-    printk(KERN_INFO "hello world\n");
-    return 0;
-
-err_class:
-    class_destroy(my_class);
-err_cdev:
-    cdev_del(&my_dev.cdev);
-err_region:
-    unregister_chrdev_region(dev, 1);
-    return -1;
-}
-
-static void __exit mymod_exit(void)
-{
-    printk(KERN_INFO "trivmod: final stats: opens=%d closes=%d\n",
-           my_dev.open_count, my_dev.release_count);
-
-    device_destroy(my_class, dev);
-    class_destroy(my_class);
-    cdev_del(&my_dev.cdev);
-    unregister_chrdev_region(dev, 1);
-    printk(KERN_INFO "bye bye world\n");
-}
-
-module_init(mymod_init);
-module_exit(mymod_exit);
+module_init(trivmod_init);
+module_exit(trivmod_exit);
+EOF
